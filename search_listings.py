@@ -58,10 +58,11 @@ scraper_status = {}
 
 # --- ScraperAPI helper -------------------------------------------------------
 
-def scrape(url):
+def scrape(url, render_js=False):
     """Fetch a URL via ScraperAPI to bypass bot-blocking."""
-    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}"
-    resp = requests.get(api_url, timeout=60)
+    render = "&render=true" if render_js else ""
+    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}{render}"
+    resp = requests.get(api_url, timeout=90)
     resp.raise_for_status()
     return resp
 
@@ -84,62 +85,61 @@ def save_state(state):
 # --- Scrapers ----------------------------------------------------------------
 
 def fetch_redfin():
+    """Fetch Redfin listings via the JSON GIS API (more reliable than CSV through proxy)."""
     listings = []
-    csv_url = (
-        "https://www.redfin.com/stingray/api/gis-csv?"
+    json_url = (
+        "https://www.redfin.com/stingray/api/gis?"
         "al=1&region_id=10004&region_type=6"
         "&min_beds=2&min_baths=1&max_price=180000&min_sqft=1000"
-        "&uipt=1&status=9&num_homes=500"
+        "&uipt=1&status=9&num_homes=500&sf=1,2,3,5,6,7"
     )
     try:
-        resp = scrape(csv_url)
-        log.info(f"Redfin CSV: status={resp.status_code} length={len(resp.text)}")
-        if "ADDRESS" in resp.text.upper():
-            reader = csv.DictReader(io.StringIO(resp.text))
-            for row in reader:
-                try:
-                    price_str = row.get("PRICE", "0").replace("$", "").replace(",", "").strip()
-                    price = int(float(price_str)) if price_str and price_str not in ("-", "") else 0
-                    if price == 0 or price > SEARCH_PARAMS["max_price"]:
-                        continue
-                    beds_str  = row.get("BEDS", "0").strip()
-                    baths_str = row.get("BATHS", "0").strip()
-                    sqft_str  = row.get("SQUARE FEET", row.get("SQFT", "0")).replace(",", "").strip()
-                    beds  = float(beds_str)  if beds_str  and beds_str  not in ("-", "") else 0
-                    baths = float(baths_str) if baths_str and baths_str not in ("-", "") else 0
-                    sqft  = float(sqft_str)  if sqft_str  and sqft_str  not in ("-", "") else 0
-                    if beds < 2 or baths < 1 or sqft < 1000:
-                        continue
-                    prop_type = row.get("PROPERTY TYPE", "").strip().lower()
-                    if prop_type and "single" not in prop_type and "house" not in prop_type and "residential" not in prop_type:
-                        continue
-                    addr    = row.get("ADDRESS", "").strip()
-                    city    = row.get("CITY", "").strip()
-                    state_  = row.get("STATE OR PROVINCE", row.get("STATE", "")).strip()
-                    zipcode = row.get("ZIP OR POSTAL CODE", row.get("ZIP", "")).strip()
-                    url_val = ""
-                    for k in row:
-                        if k.upper().startswith("URL"):
-                            url_val = row[k].strip()
-                            break
-                    full_url  = url_val if url_val.startswith("http") else f"https://www.redfin.com{url_val}"
-                    full_addr = f"{addr}, {city}, {state_} {zipcode}".strip(", ")
-                    listings.append({
-                        "id":      f"redfin:{addr.lower().replace(' ', '-')}-{zipcode}",
-                        "source":  "Redfin",
-                        "address": full_addr,
-                        "price":   price,
-                        "details": f"{int(beds)} BD / {baths:.0f} BA / {int(sqft):,} sq ft",
-                        "url":     full_url,
-                    })
-                except Exception as e:
-                    log.debug(f"Redfin row error: {e}")
-            scraper_status["Redfin"] = f"OK - {len(listings)} listings"
-            log.info(f"Redfin: {len(listings)} qualifying listings")
-            return listings
-        else:
-            log.warning(f"Redfin CSV unexpected: {resp.text[:300]}")
-            scraper_status["Redfin"] = f"CSV parse failed"
+        resp = scrape(json_url)
+        text = resp.text.strip()
+        log.info(f"Redfin JSON raw: status={resp.status_code} length={len(text)} preview={text[:120]}")
+
+        # Redfin prefixes its JSON responses with "{}&&"
+        if text.startswith("{}&&"):
+            text = text[4:]
+
+        data = json.loads(text)
+        homes = (
+            data.get("payload", {}).get("homes", [])
+            or data.get("payload", {}).get("searchResults", {}).get("listingResultsPage", {}).get("results", [])
+        )
+        log.info(f"Redfin JSON: {len(homes)} raw results")
+
+        for h in homes:
+            try:
+                price = h.get("price", {}).get("value", 0) or 0
+                if price == 0 or price > SEARCH_PARAMS["max_price"]:
+                    continue
+                beds  = h.get("beds",  0) or 0
+                baths = h.get("baths", 0) or 0
+                sqft  = h.get("sqFt",  {}).get("value", 0) or h.get("sqft", 0) or 0
+                if beds < 2 or baths < 1 or sqft < 1000:
+                    continue
+                addr    = h.get("streetLine", {}).get("value", "") or h.get("address", {}).get("streetLine", "")
+                city    = h.get("cityStateZip", {}).get("value", "") or ""
+                url_path = h.get("url", "")
+                full_url = f"https://www.redfin.com{url_path}" if url_path else "https://www.redfin.com"
+                full_addr = f"{addr}, {city}".strip(", ")
+                listings.append({
+                    "id":      f"redfin:{addr.lower().replace(' ', '-')}",
+                    "source":  "Redfin",
+                    "address": full_addr,
+                    "price":   price,
+                    "details": f"{int(beds)} BD / {baths:.0f} BA / {int(sqft):,} sq ft",
+                    "url":     full_url,
+                })
+            except Exception as e:
+                log.debug(f"Redfin row error: {e}")
+
+        scraper_status["Redfin"] = f"OK - {len(listings)} listings"
+        log.info(f"Redfin: {len(listings)} qualifying listings")
+    except json.JSONDecodeError as e:
+        log.warning(f"Redfin JSON parse error: {e}")
+        scraper_status["Redfin"] = f"JSON parse failed - {e}"
     except Exception as e:
         log.warning(f"Redfin error: {e}")
         scraper_status["Redfin"] = f"FAILED - {e}"
@@ -147,16 +147,17 @@ def fetch_redfin():
 
 
 def fetch_realtor():
+    """Fetch Realtor.com listings with JS rendering enabled."""
     listings = []
     url = "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000"
     try:
-        resp = scrape(url)
+        resp = scrape(url, render_js=True)
         log.info(f"Realtor.com: status={resp.status_code} length={len(resp.text)}")
         soup   = BeautifulSoup(resp.text, "lxml")
         script = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script:
             log.warning("Realtor.com: __NEXT_DATA__ not found")
-            scraper_status["Realtor.com"] = "Page structure not found"
+            scraper_status["Realtor.com"] = "Page structure not found (no __NEXT_DATA__)"
             return listings
         data  = json.loads(script.string)
         props = []
@@ -255,7 +256,7 @@ def build_html_report(new_listings, price_changes, all_listings, is_day_one, run
             price_cell = f"<strong style='color:#1a6b1a'>${l['price']:,}</strong>"
             if show_old_price and "old_price" in l:
                 diff  = l["price"] - l["old_price"]
-                arrow = "v" if diff < 0 else "^"
+                arrow = "▼" if diff < 0 else "▲"
                 color = "#1a6b1a" if diff < 0 else "#b71c1c"
                 price_cell += f"<br><span style='color:{color};font-size:11px'>{arrow} ${abs(diff):,} (was ${l['old_price']:,})</span>"
             rows += f"""<tr style="border-bottom:1px solid #eee">
