@@ -1,4 +1,4 @@
-name: Daily Las Cruces SFR Report
+name:Daily Las Cruces SFR Report
 
 on:
   schedule:
