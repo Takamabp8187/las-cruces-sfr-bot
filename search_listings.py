@@ -1,7 +1,7 @@
 """
 Las Cruces, NM - Daily SFR Listing Report
 ==========================================
-Searches Redfin and Realtor.com for single-family homes
+Searches Redfin and Trulia for single-family homes
 in Las Cruces, NM under $180,000 with >=2 BD, >=1 BA, >=1,000 sq ft.
 
 Requests are routed through ScraperAPI to bypass bot-blocking.
@@ -18,8 +18,6 @@ Environment variables:
 """
 
 import os
-import csv
-import io
 import json
 import datetime
 import smtplib
@@ -60,8 +58,8 @@ scraper_status = {}
 
 def scrape(url, render_js=False, premium=False):
     """Fetch a URL via ScraperAPI to bypass bot-blocking.
-    render_js=True  -- uses headless browser (5x credits, needed for JS-heavy pages)
-    premium=True    -- uses residential IPs (10x credits, harder to block)
+    render_js=True  -- uses headless browser (needed for JS-heavy pages)
+    premium=True    -- uses residential IPs (harder to block)
     """
     parts = ""
     if render_js:
@@ -153,76 +151,88 @@ def fetch_redfin():
     return listings
 
 
-def fetch_realtor():
-    """Fetch Realtor.com listings using premium residential proxies."""
+def fetch_trulia():
+    """Fetch Trulia listings using premium residential proxies."""
     listings = []
-    url = "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000"
+    url = "https://www.trulia.com/for_sale/Las_Cruces,NM/SINGLE-FAMILY_HOME_type/180000_price/2p_beds/1000sqft_sqft/"
     try:
-        # Use premium residential proxies -- harder for Realtor.com to block.
-        # Realtor.com's __NEXT_DATA__ is server-side rendered so we don't need render_js.
         resp = scrape(url, premium=True)
-        log.info(f"Realtor.com: status={resp.status_code} length={len(resp.text)}")
+        log.info(f"Trulia: status={resp.status_code} length={len(resp.text)}")
         soup   = BeautifulSoup(resp.text, "lxml")
         script = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script:
-            log.warning("Realtor.com: __NEXT_DATA__ not found")
-            scraper_status["Realtor.com"] = "Page structure not found (no __NEXT_DATA__)"
+            log.warning("Trulia: __NEXT_DATA__ not found")
+            scraper_status["Trulia"] = "Page structure not found (no __NEXT_DATA__)"
             return listings
+
         data  = json.loads(script.string)
-        props = []
+        homes = []
+        # Try multiple known data paths for Trulia's Next.js structure
         for path in [
-            ["props", "pageProps", "properties"],
-            ["props", "pageProps", "searchResults", "home_search", "results"],
-            ["props", "pageProps", "searchResults", "results"],
+            ["props", "pageProps", "searchData", "homes"],
+            ["props", "pageProps", "initialReduxState", "searchResults", "homes"],
+            ["props", "pageProps", "searchResults", "homes"],
+            ["props", "pageProps", "homes"],
         ]:
             try:
                 node = data
                 for key in path:
                     node = node[key]
                 if node:
-                    props = node
+                    homes = node
                     break
             except (KeyError, TypeError):
                 continue
-        log.info(f"Realtor.com raw results: {len(props)}")
-        for p in props:
+
+        log.info(f"Trulia raw results: {len(homes)}")
+
+        for h in homes:
             try:
-                price = p.get("list_price", 0) or p.get("price", 0) or 0
-                if price > SEARCH_PARAMS["max_price"]:
+                # Price
+                price = 0
+                lp = h.get("price", h.get("listingPrice", {}))
+                if isinstance(lp, dict):
+                    price = int(lp.get("price", lp.get("amount", 0)) or 0)
+                elif isinstance(lp, (int, float)):
+                    price = int(lp)
+                if price == 0 or price > SEARCH_PARAMS["max_price"]:
                     continue
-                desc  = p.get("description", {})
-                beds  = desc.get("beds",  p.get("beds",  0)) or 0
-                baths = desc.get("baths_consolidated", desc.get("baths", p.get("baths", 0))) or 0
-                sqft  = desc.get("sqft",  p.get("sqft",  0)) or 0
+
+                beds  = int(h.get("bedrooms", h.get("beds", 0)) or 0)
+                baths = float(h.get("bathrooms", h.get("baths", 0)) or 0)
+
+                fs = h.get("floorSpace", {})
+                sqft = int(fs.get("squareFeet", fs.get("dimension", 0)) or 0) if isinstance(fs, dict) else int(fs or 0)
+
                 if beds < 2 or baths < 1 or sqft < 1000:
                     continue
-                prop_type = (desc.get("type", p.get("sub_type", "")) or "").lower()
-                if prop_type and "single" not in prop_type and "house" not in prop_type and "sfr" not in prop_type:
-                    continue
-                loc       = p.get("location", {}).get("address", p.get("address", {}))
-                line      = loc.get("line", loc.get("street", "")) or ""
-                city      = loc.get("city", "") or ""
-                st        = loc.get("state_code", loc.get("state", "")) or ""
-                zc        = loc.get("postal_code", loc.get("zip", "")) or ""
-                full_addr = f"{line}, {city}, {st} {zc}".strip(", ")
-                slug      = p.get("permalink", p.get("property_id", ""))
-                full_url  = f"https://www.realtor.com/realestateandhomes-detail/{slug}" if slug else ""
-                pid       = p.get("property_id", full_addr)
+
+                loc  = h.get("location", {})
+                addr = (
+                    loc.get("fullAddress", "")
+                    or loc.get("address", {}).get("formattedAddress", "")
+                    or loc.get("address", {}).get("line1", "")
+                ) if isinstance(loc, dict) else str(loc)
+
+                slug     = h.get("url", h.get("relativeUrl", ""))
+                full_url = f"https://www.trulia.com{slug}" if slug and not slug.startswith("http") else (slug or "https://www.trulia.com")
+
                 listings.append({
-                    "id":      f"realtor:{pid}",
-                    "source":  "Realtor.com",
-                    "address": full_addr,
+                    "id":      f"trulia:{addr.lower().replace(' ', '-')}",
+                    "source":  "Trulia",
+                    "address": addr,
                     "price":   price,
-                    "details": f"{beds} BD / {baths} BA / {int(sqft):,} sq ft",
+                    "details": f"{beds} BD / {baths:.0f} BA / {sqft:,} sq ft",
                     "url":     full_url,
                 })
             except Exception as e:
-                log.debug(f"Realtor.com row error: {e}")
-        scraper_status["Realtor.com"] = f"OK - {len(listings)} listings"
-        log.info(f"Realtor.com: {len(listings)} qualifying listings")
+                log.debug(f"Trulia row error: {e}")
+
+        scraper_status["Trulia"] = f"OK - {len(listings)} listings"
+        log.info(f"Trulia: {len(listings)} qualifying listings")
     except Exception as e:
-        log.warning(f"Realtor.com error: {e}")
-        scraper_status["Realtor.com"] = f"FAILED - {e}"
+        log.warning(f"Trulia error: {e}")
+        scraper_status["Trulia"] = f"FAILED - {e}"
     return listings
 
 
@@ -321,7 +331,7 @@ def build_html_report(new_listings, price_changes, all_listings, is_day_one, run
     <p>Search manually:
       <a href="https://www.zillow.com/las-cruces-nm/houses/?searchQueryState=%7B%22filterState%22%3A%7B%22price%22%3A%7B%22max%22%3A180000%7D%2C%22beds%22%3A%7B%22min%22%3A2%7D%2C%22baths%22%3A%7B%22min%22%3A1%7D%2C%22sqft%22%3A%7B%22min%22%3A1000%7D%7D%7D">Zillow</a> /
       <a href="https://www.redfin.com/city/10004/NM/Las-Cruces/filter/max-price=180000,min-beds=2,min-baths=1,min-sqft=1000,property-type=house">Redfin</a> /
-      <a href="https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000">Realtor.com</a>
+      <a href="https://www.trulia.com/for_sale/Las_Cruces,NM/SINGLE-FAMILY_HOME_type/180000_price/2p_beds/1000sqft_sqft/">Trulia</a>
     </p>
   </div>
 </body></html>"""
@@ -350,7 +360,7 @@ def main():
     is_day_one = len(state) == 0
 
     log.info("Fetching listings via ScraperAPI...")
-    listings = deduplicate(fetch_redfin() + fetch_realtor())
+    listings = deduplicate(fetch_redfin() + fetch_trulia())
     log.info(f"Total unique qualifying listings: {len(listings)}")
 
     new_l, price_ch, all_l = compute_diff(listings, state)
