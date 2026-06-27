@@ -158,7 +158,7 @@ def fetch_realtor():
     listings = []
     url = "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000"
     try:
-        # Use premium residential proxies — harder for Realtor.com to block.
+        # Use premium residential proxies -- harder for Realtor.com to block.
         # Realtor.com's __NEXT_DATA__ is server-side rendered so we don't need render_js.
         resp = scrape(url, premium=True)
         log.info(f"Realtor.com: status={resp.status_code} length={len(resp.text)}")
