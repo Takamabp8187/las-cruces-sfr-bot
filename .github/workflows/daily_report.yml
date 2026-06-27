@@ -5,11 +5,11 @@ on:
     # Runs at 8:00 AM Mountain Time (14:00 UTC, or 15:00 UTC in MDT)
     # Las Cruces is UTC-7 (MDT summer) / UTC-6 (MST winter)
     # Adjust the hour below if needed:
-    #   8 AM MDT = 15:00 UTC  → use "0 15 * * *"
-    #   8 AM MST = 14:00 UTC  → use "0 14 * * *"
-    - cron: '0 15 * * *'   # 8:00 AM Mountain Daylight Time
+    #   8 AM MDT = 15:00 UTC  -> use "0 15 * * *"
+    #   8 AM MST = 14:00 UTC  -> use "0 14 * * *"
+    - cron: '0 15 * * *'    # 8:00 AM Mountain Daylight Time
 
-  workflow_dispatch:         # Allow manual runs from GitHub UI
+  workflow_dispatch:          # Allow manual runs from GitHub UI
 
 jobs:
   run-report:
@@ -19,7 +19,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Restore cached state file (tracks seen listings across runs)
       - name: Restore listing state cache
         uses: actions/cache@v4
         with:
@@ -34,19 +33,17 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml python-dotenv
+        run: pip install requests beautifulsoup4
 
-      - name: Run listing search & send email
+      - name: Run listing search
         env:
-          GMAIL_USER:      ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS:  ${{ secrets.GMAIL_APP_PASS }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          STATE_FILE:      state.json
         run: python search_listings.py
 
-      # Save updated state back to cache
       - name: Save listing state cache
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: state.json
           key: listing-state-${{ runner.os }}
