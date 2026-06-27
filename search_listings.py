@@ -58,11 +58,18 @@ scraper_status = {}
 
 # --- ScraperAPI helper -------------------------------------------------------
 
-def scrape(url, render_js=False):
-    """Fetch a URL via ScraperAPI to bypass bot-blocking."""
-    render = "&render=true" if render_js else ""
-    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}{render}"
-    resp = requests.get(api_url, timeout=90)
+def scrape(url, render_js=False, premium=False):
+    """Fetch a URL via ScraperAPI to bypass bot-blocking.
+    render_js=True  -- uses headless browser (5x credits, needed for JS-heavy pages)
+    premium=True    -- uses residential IPs (10x credits, harder to block)
+    """
+    parts = ""
+    if render_js:
+        parts += "&render=true"
+    if premium:
+        parts += "&premium=true"
+    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}{parts}"
+    resp = requests.get(api_url, timeout=120)
     resp.raise_for_status()
     return resp
 
@@ -85,7 +92,7 @@ def save_state(state):
 # --- Scrapers ----------------------------------------------------------------
 
 def fetch_redfin():
-    """Fetch Redfin listings via the JSON GIS API (more reliable than CSV through proxy)."""
+    """Fetch Redfin listings via the JSON GIS API."""
     listings = []
     json_url = (
         "https://www.redfin.com/stingray/api/gis?"
@@ -96,7 +103,7 @@ def fetch_redfin():
     try:
         resp = scrape(json_url)
         text = resp.text.strip()
-        log.info(f"Redfin JSON raw: status={resp.status_code} length={len(text)} preview={text[:120]}")
+        log.info(f"Redfin JSON: status={resp.status_code} length={len(text)} preview={text[:120]}")
 
         # Redfin prefixes its JSON responses with "{}&&"
         if text.startswith("{}&&"):
@@ -107,7 +114,7 @@ def fetch_redfin():
             data.get("payload", {}).get("homes", [])
             or data.get("payload", {}).get("searchResults", {}).get("listingResultsPage", {}).get("results", [])
         )
-        log.info(f"Redfin JSON: {len(homes)} raw results")
+        log.info(f"Redfin raw results: {len(homes)}")
 
         for h in homes:
             try:
@@ -116,14 +123,14 @@ def fetch_redfin():
                     continue
                 beds  = h.get("beds",  0) or 0
                 baths = h.get("baths", 0) or 0
-                sqft  = h.get("sqFt",  {}).get("value", 0) or h.get("sqft", 0) or 0
+                sqft  = h.get("sqFt", {}).get("value", 0) or h.get("sqft", 0) or 0
                 if beds < 2 or baths < 1 or sqft < 1000:
                     continue
-                addr    = h.get("streetLine", {}).get("value", "") or h.get("address", {}).get("streetLine", "")
-                city    = h.get("cityStateZip", {}).get("value", "") or ""
+                addr     = h.get("streetLine", {}).get("value", "") or h.get("address", {}).get("streetLine", "")
+                city_st  = h.get("cityStateZip", {}).get("value", "") or ""
                 url_path = h.get("url", "")
                 full_url = f"https://www.redfin.com{url_path}" if url_path else "https://www.redfin.com"
-                full_addr = f"{addr}, {city}".strip(", ")
+                full_addr = f"{addr}, {city_st}".strip(", ")
                 listings.append({
                     "id":      f"redfin:{addr.lower().replace(' ', '-')}",
                     "source":  "Redfin",
@@ -147,11 +154,13 @@ def fetch_redfin():
 
 
 def fetch_realtor():
-    """Fetch Realtor.com listings with JS rendering enabled."""
+    """Fetch Realtor.com listings using premium residential proxies."""
     listings = []
     url = "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000"
     try:
-        resp = scrape(url, render_js=True)
+        # Use premium residential proxies — harder for Realtor.com to block.
+        # Realtor.com's __NEXT_DATA__ is server-side rendered so we don't need render_js.
+        resp = scrape(url, premium=True)
         log.info(f"Realtor.com: status={resp.status_code} length={len(resp.text)}")
         soup   = BeautifulSoup(resp.text, "lxml")
         script = soup.find("script", {"id": "__NEXT_DATA__"})
@@ -175,7 +184,7 @@ def fetch_realtor():
                     break
             except (KeyError, TypeError):
                 continue
-        log.info(f"Realtor.com: {len(props)} raw results")
+        log.info(f"Realtor.com raw results: {len(props)}")
         for p in props:
             try:
                 price = p.get("list_price", 0) or p.get("price", 0) or 0
@@ -256,7 +265,7 @@ def build_html_report(new_listings, price_changes, all_listings, is_day_one, run
             price_cell = f"<strong style='color:#1a6b1a'>${l['price']:,}</strong>"
             if show_old_price and "old_price" in l:
                 diff  = l["price"] - l["old_price"]
-                arrow = "▼" if diff < 0 else "▲"
+                arrow = "&#9660;" if diff < 0 else "&#9650;"
                 color = "#1a6b1a" if diff < 0 else "#b71c1c"
                 price_cell += f"<br><span style='color:{color};font-size:11px'>{arrow} ${abs(diff):,} (was ${l['old_price']:,})</span>"
             rows += f"""<tr style="border-bottom:1px solid #eee">
