@@ -1,34 +1,33 @@
 """
-Las Cruces, NM — Daily SFR Listing Report
+Las Cruces, NM - Daily SFR Listing Report
 ==========================================
-Scrapes Zillow, Redfin, and Realtor.com for single-family homes
-in Las Cruces, NM under $180,000 with ≥2 BD, ≥1 BA, ≥1,000 sq ft.
+Searches Redfin and Realtor.com for single-family homes
+in Las Cruces, NM under $180,000 with >=2 BD, >=1 BA, >=1,000 sq ft.
+
+Requests are routed through ScraperAPI to bypass bot-blocking.
 
 Day 1: Sends all active qualifying listings.
 Day 2+: Sends only new listings and price changes since the previous run.
 
-Setup:
-  pip install requests beautifulsoup4 lxml python-dotenv
-
-Usage:
-  python search_listings.py
-
-Environment variables (in .env file):
-  GMAIL_USER       — your Gmail address
-  GMAIL_APP_PASS   — Gmail App Password (not your regular password)
-  RECIPIENT_EMAIL  — where to send the report
-  STATE_FILE       — path to JSON file that tracks seen listings (default: state.json)
+Environment variables:
+  GMAIL_USER       -- your Gmail address
+  GMAIL_APP_PASS   -- Gmail App Password
+  RECIPIENT_EMAIL  -- where to send the report
+  SCRAPER_API_KEY  -- your ScraperAPI key (scraperapi.com)
+  STATE_FILE       -- path to state JSON file (default: state.json)
 """
 
 import os
+import csv
+import io
 import json
-import time
 import datetime
 import smtplib
 import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,43 +35,40 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+# --- Config ------------------------------------------------------------------
 
 GMAIL_USER      = os.getenv("GMAIL_USER", "")
 GMAIL_APP_PASS  = os.getenv("GMAIL_APP_PASS", "")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "bartljordan@gmail.com")
 STATE_FILE      = os.getenv("STATE_FILE", "state.json")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 
 SEARCH_PARAMS = {
-    "city":      "Las Cruces",
-    "state":     "NM",
     "max_price": 180_000,
     "min_beds":  2,
     "min_baths": 1,
     "min_sqft":  1_000,
-    "type":      "single-family",
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+scraper_status = {}
 
-# ─── State management ────────────────────────────────────────────────────────
 
-def load_state() -> dict:
-    """Load previously seen listings from disk."""
+# --- ScraperAPI helper -------------------------------------------------------
+
+def scrape(url):
+    """Fetch a URL via ScraperAPI to bypass bot-blocking."""
+    api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}"
+    resp = requests.get(api_url, timeout=60)
+    resp.raise_for_status()
+    return resp
+
+
+# --- State management --------------------------------------------------------
+
+def load_state():
     p = Path(STATE_FILE)
     if p.exists():
         with open(p) as f:
@@ -80,228 +76,162 @@ def load_state() -> dict:
     return {}
 
 
-def save_state(state: dict):
-    """Persist listing state to disk."""
+def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-# ─── Scrapers ────────────────────────────────────────────────────────────────
+# --- Scrapers ----------------------------------------------------------------
 
-def fetch_zillow() -> list[dict]:
-    """
-    Fetch listings from Zillow.
-    Note: Zillow aggressively blocks scrapers. This uses their
-    public search URL. If blocked, rotate User-Agent or use
-    ScraperAPI / BrightData proxy (see README).
-    """
-    url = (
-        "https://www.zillow.com/las-cruces-nm/houses/"
-        "?searchQueryState=%7B%22filterState%22%3A%7B"
-        "%22price%22%3A%7B%22max%22%3A180000%7D%2C"
-        "%22beds%22%3A%7B%22min%22%3A2%7D%2C"
-        "%22baths%22%3A%7B%22min%22%3A1%7D%2C"
-        "%22sqft%22%3A%7B%22min%22%3A1000%7D%2C"
-        "%22con%22%3A%7B%22value%22%3Afalse%7D%2C"
-        "%22apa%22%3A%7B%22value%22%3Afalse%7D%2C"
-        "%22mf%22%3A%7B%22value%22%3Afalse%7D%2C"
-        "%22land%22%3A%7B%22value%22%3Afalse%7D%7D%7D"
-    )
+def fetch_redfin():
     listings = []
+    csv_url = (
+        "https://www.redfin.com/stingray/api/gis-csv?"
+        "al=1&region_id=10004&region_type=6"
+        "&min_beds=2&min_baths=1&max_price=180000&min_sqft=1000"
+        "&uipt=1&status=9&num_homes=500"
+    )
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # Zillow embeds listing data in a <script> tag as JSON
-        import re
-        pattern = re.compile(r'"zpid":(\d+).*?"price":(\d+).*?"beds":(\d+).*?"baths":([\d.]+).*?"livingArea":(\d+).*?"streetAddress":"([^"]+)".*?"city":"([^"]+)".*?"state":"([^"]+)".*?"zipcode":"([^"]+)"', re.DOTALL)
-        # Fallback: parse visible listing cards
-        cards = soup.select("article.list-card, [data-test='property-card']")
-        for card in cards:
-            try:
-                price_el  = card.select_one("[data-test='property-card-price'], .list-card-price")
-                addr_el   = card.select_one("address, .list-card-addr")
-                detail_el = card.select_one(".list-card-details, [data-test='property-card-details']")
-                link_el   = card.select_one("a[href]")
-
-                if not (price_el and addr_el):
-                    continue
-
-                price_str = price_el.get_text(strip=True).replace("$", "").replace(",", "").replace("+", "")
-                price     = int("".join(filter(str.isdigit, price_str))) if price_str else 0
-
-                if price == 0 or price > SEARCH_PARAMS["max_price"]:
-                    continue
-
-                addr = addr_el.get_text(strip=True)
-                href = link_el["href"] if link_el else ""
-                if href and not href.startswith("http"):
-                    href = "https://www.zillow.com" + href
-
-                details = detail_el.get_text(" ", strip=True) if detail_el else ""
-
-                listings.append({
-                    "id":      f"zillow:{addr.lower().replace(' ', '-')}",
-                    "source":  "Zillow",
-                    "address": addr,
-                    "price":   price,
-                    "details": details,
-                    "url":     href,
-                })
-            except Exception as e:
-                log.debug(f"Zillow card parse error: {e}")
-
-        log.info(f"Zillow: found {len(listings)} qualifying cards")
+        resp = scrape(csv_url)
+        log.info(f"Redfin CSV: status={resp.status_code} length={len(resp.text)}")
+        if "ADDRESS" in resp.text.upper():
+            reader = csv.DictReader(io.StringIO(resp.text))
+            for row in reader:
+                try:
+                    price_str = row.get("PRICE", "0").replace("$", "").replace(",", "").strip()
+                    price = int(float(price_str)) if price_str and price_str not in ("-", "") else 0
+                    if price == 0 or price > SEARCH_PARAMS["max_price"]:
+                        continue
+                    beds_str  = row.get("BEDS", "0").strip()
+                    baths_str = row.get("BATHS", "0").strip()
+                    sqft_str  = row.get("SQUARE FEET", row.get("SQFT", "0")).replace(",", "").strip()
+                    beds  = float(beds_str)  if beds_str  and beds_str  not in ("-", "") else 0
+                    baths = float(baths_str) if baths_str and baths_str not in ("-", "") else 0
+                    sqft  = float(sqft_str)  if sqft_str  and sqft_str  not in ("-", "") else 0
+                    if beds < 2 or baths < 1 or sqft < 1000:
+                        continue
+                    prop_type = row.get("PROPERTY TYPE", "").strip().lower()
+                    if prop_type and "single" not in prop_type and "house" not in prop_type and "residential" not in prop_type:
+                        continue
+                    addr    = row.get("ADDRESS", "").strip()
+                    city    = row.get("CITY", "").strip()
+                    state_  = row.get("STATE OR PROVINCE", row.get("STATE", "")).strip()
+                    zipcode = row.get("ZIP OR POSTAL CODE", row.get("ZIP", "")).strip()
+                    url_val = ""
+                    for k in row:
+                        if k.upper().startswith("URL"):
+                            url_val = row[k].strip()
+                            break
+                    full_url  = url_val if url_val.startswith("http") else f"https://www.redfin.com{url_val}"
+                    full_addr = f"{addr}, {city}, {state_} {zipcode}".strip(", ")
+                    listings.append({
+                        "id":      f"redfin:{addr.lower().replace(' ', '-')}-{zipcode}",
+                        "source":  "Redfin",
+                        "address": full_addr,
+                        "price":   price,
+                        "details": f"{int(beds)} BD / {baths:.0f} BA / {int(sqft):,} sq ft",
+                        "url":     full_url,
+                    })
+                except Exception as e:
+                    log.debug(f"Redfin row error: {e}")
+            scraper_status["Redfin"] = f"OK - {len(listings)} listings"
+            log.info(f"Redfin: {len(listings)} qualifying listings")
+            return listings
+        else:
+            log.warning(f"Redfin CSV unexpected: {resp.text[:300]}")
+            scraper_status["Redfin"] = f"CSV parse failed"
     except Exception as e:
-        log.warning(f"Zillow fetch error: {e}")
-
+        log.warning(f"Redfin error: {e}")
+        scraper_status["Redfin"] = f"FAILED - {e}"
     return listings
 
 
-def fetch_redfin() -> list[dict]:
-    """Fetch listings from Redfin's GIS API (more scraper-friendly)."""
-    # Redfin GIS search endpoint
-    url = (
-        "https://www.redfin.com/stingray/api/gis?al=1"
-        "&market=las-cruces"
-        "&max_price=180000"
-        "&min_beds=2"
-        "&min_baths=1"
-        "&min_sqft=1000"
-        "&property_type=1"  # 1 = single family
-        "&status=1"         # active
-        "&region_id=17185"  # Las Cruces, NM
-        "&region_type=6"
-        "&num_homes=350"
-    )
+def fetch_realtor():
     listings = []
+    url = "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000"
     try:
-        resp = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=15)
-        # Redfin prefixes JSON with ")]}'\n" to prevent CSRF
-        text = resp.text
-        if text.startswith(")]}"):
-            text = text[text.index("\n") + 1:]
-        data = json.loads(text)
-
-        homes = data.get("payload", {}).get("homes", [])
-        for h in homes:
-            price = h.get("price", {}).get("value", 0)
-            beds  = h.get("beds", 0)
-            baths = h.get("baths", 0)
-            sqft  = h.get("sqFt", {}).get("value", 0)
-            if price > SEARCH_PARAMS["max_price"]:
-                continue
-            if beds < SEARCH_PARAMS["min_beds"]:
-                continue
-            if baths < SEARCH_PARAMS["min_baths"]:
-                continue
-            if sqft < SEARCH_PARAMS["min_sqft"]:
-                continue
-
-            addr = h.get("streetLine", {}).get("value", "")
-            city = h.get("city", "")
-            state = h.get("state", "")
-            zipcode = h.get("zip", "")
-            full_addr = f"{addr}, {city}, {state} {zipcode}"
-            url_path = h.get("url", "")
-            full_url = f"https://www.redfin.com{url_path}" if url_path else ""
-
-            listings.append({
-                "id":      f"redfin:{h.get('mlsId', {}).get('value', full_addr)}",
-                "source":  "Redfin",
-                "address": full_addr,
-                "price":   price,
-                "details": f"{beds} BD / {baths} BA · {sqft:,} sq ft",
-                "url":     full_url,
-            })
-
-        log.info(f"Redfin: found {len(listings)} qualifying homes")
-    except Exception as e:
-        log.warning(f"Redfin fetch error: {e}")
-
-    return listings
-
-
-def fetch_realtor() -> list[dict]:
-    """Fetch from Realtor.com using their public search page."""
-    url = (
-        "https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM"
-        "/type-single-family-home/price-na-180000/beds-2/sqft-1000"
-    )
-    listings = []
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        import re, json as _json
-        # Realtor.com embeds data in __NEXT_DATA__
+        resp = scrape(url)
+        log.info(f"Realtor.com: status={resp.status_code} length={len(resp.text)}")
+        soup   = BeautifulSoup(resp.text, "lxml")
         script = soup.find("script", {"id": "__NEXT_DATA__"})
-        if script:
-            data = _json.loads(script.string)
-            props = (
-                data.get("props", {})
-                    .get("pageProps", {})
-                    .get("properties", [])
-            )
-            for p in props:
-                price = p.get("list_price", 0) or 0
+        if not script:
+            log.warning("Realtor.com: __NEXT_DATA__ not found")
+            scraper_status["Realtor.com"] = "Page structure not found"
+            return listings
+        data  = json.loads(script.string)
+        props = []
+        for path in [
+            ["props", "pageProps", "properties"],
+            ["props", "pageProps", "searchResults", "home_search", "results"],
+            ["props", "pageProps", "searchResults", "results"],
+        ]:
+            try:
+                node = data
+                for key in path:
+                    node = node[key]
+                if node:
+                    props = node
+                    break
+            except (KeyError, TypeError):
+                continue
+        log.info(f"Realtor.com: {len(props)} raw results")
+        for p in props:
+            try:
+                price = p.get("list_price", 0) or p.get("price", 0) or 0
                 if price > SEARCH_PARAMS["max_price"]:
                     continue
-                beds  = p.get("description", {}).get("beds", 0) or 0
-                baths = p.get("description", {}).get("baths", 0) or 0
-                sqft  = p.get("description", {}).get("sqft", 0) or 0
+                desc  = p.get("description", {})
+                beds  = desc.get("beds",  p.get("beds",  0)) or 0
+                baths = desc.get("baths_consolidated", desc.get("baths", p.get("baths", 0))) or 0
+                sqft  = desc.get("sqft",  p.get("sqft",  0)) or 0
                 if beds < 2 or baths < 1 or sqft < 1000:
                     continue
-
-                addr = p.get("location", {}).get("address", {})
-                full_addr = f"{addr.get('line', '')}, {addr.get('city', '')}, {addr.get('state_code', '')} {addr.get('postal_code', '')}"
-                slug = p.get("permalink", "")
-                full_url = f"https://www.realtor.com/realestateandhomes-detail/{slug}" if slug else ""
-
+                prop_type = (desc.get("type", p.get("sub_type", "")) or "").lower()
+                if prop_type and "single" not in prop_type and "house" not in prop_type and "sfr" not in prop_type:
+                    continue
+                loc       = p.get("location", {}).get("address", p.get("address", {}))
+                line      = loc.get("line", loc.get("street", "")) or ""
+                city      = loc.get("city", "") or ""
+                st        = loc.get("state_code", loc.get("state", "")) or ""
+                zc        = loc.get("postal_code", loc.get("zip", "")) or ""
+                full_addr = f"{line}, {city}, {st} {zc}".strip(", ")
+                slug      = p.get("permalink", p.get("property_id", ""))
+                full_url  = f"https://www.realtor.com/realestateandhomes-detail/{slug}" if slug else ""
+                pid       = p.get("property_id", full_addr)
                 listings.append({
-                    "id":      f"realtor:{p.get('property_id', full_addr)}",
+                    "id":      f"realtor:{pid}",
                     "source":  "Realtor.com",
-                    "address": full_addr.strip(),
+                    "address": full_addr,
                     "price":   price,
-                    "details": f"{beds} BD / {baths} BA · {sqft:,} sq ft",
+                    "details": f"{beds} BD / {baths} BA / {int(sqft):,} sq ft",
                     "url":     full_url,
                 })
-
-        log.info(f"Realtor.com: found {len(listings)} qualifying homes")
+            except Exception as e:
+                log.debug(f"Realtor.com row error: {e}")
+        scraper_status["Realtor.com"] = f"OK - {len(listings)} listings"
+        log.info(f"Realtor.com: {len(listings)} qualifying listings")
     except Exception as e:
-        log.warning(f"Realtor.com fetch error: {e}")
-
+        log.warning(f"Realtor.com error: {e}")
+        scraper_status["Realtor.com"] = f"FAILED - {e}"
     return listings
 
 
-# ─── Deduplication ───────────────────────────────────────────────────────────
+# --- Deduplication -----------------------------------------------------------
 
-def deduplicate(listings: list[dict]) -> list[dict]:
-    """Remove cross-source duplicates by normalizing addresses."""
-    seen_addrs = set()
-    unique = []
+def deduplicate(listings):
+    seen, unique = set(), []
     for l in listings:
         key = l["address"].lower().strip().split(",")[0].strip()
-        if key not in seen_addrs:
-            seen_addrs.add(key)
+        if key not in seen:
+            seen.add(key)
             unique.append(l)
     return unique
 
 
-# ─── Diff against previous state ─────────────────────────────────────────────
+# --- Diff --------------------------------------------------------------------
 
-def compute_diff(listings: list[dict], state: dict) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Returns:
-        new_listings    — IDs not seen before
-        price_changes   — same ID but price changed
-        all_listings    — full list (for Day 1)
-    """
-    new_listings   = []
-    price_changes  = []
-
+def compute_diff(listings, state):
+    new_listings, price_changes = [], []
     for l in listings:
         lid = l["id"]
         if lid not in state:
@@ -309,163 +239,122 @@ def compute_diff(listings: list[dict], state: dict) -> tuple[list[dict], list[di
         elif state[lid]["price"] != l["price"]:
             l["old_price"] = state[lid]["price"]
             price_changes.append(l)
-
     return new_listings, price_changes, listings
 
 
-# ─── Email builder ───────────────────────────────────────────────────────────
+# --- Email -------------------------------------------------------------------
 
-def build_html_report(
-    new_listings: list[dict],
-    price_changes: list[dict],
-    all_listings: list[dict],
-    is_day_one: bool,
-    run_date: str,
-) -> str:
+def build_html_report(new_listings, price_changes, all_listings, is_day_one, run_date):
+    th = "style='padding:10px;text-align:left;background:#2c5f8a;color:white'"
+
     def listing_rows(items, show_old_price=False):
         if not items:
-            return "<tr><td colspan='5' style='color:#888;padding:12px'>None today.</td></tr>"
+            return "<tr><td colspan='4' style='color:#888;padding:12px'>None today.</td></tr>"
         rows = ""
         for l in items:
             price_cell = f"<strong style='color:#1a6b1a'>${l['price']:,}</strong>"
             if show_old_price and "old_price" in l:
-                diff = l["price"] - l["old_price"]
-                arrow = "▼" if diff < 0 else "▲"
+                diff  = l["price"] - l["old_price"]
+                arrow = "v" if diff < 0 else "^"
                 color = "#1a6b1a" if diff < 0 else "#b71c1c"
-                price_cell += (
-                    f"<br><span style='color:{color};font-size:11px'>"
-                    f"{arrow} ${abs(diff):,} (was ${l['old_price']:,})</span>"
-                )
-            rows += f"""
-            <tr>
-              <td><a href="{l['url']}" style="color:#2c5f8a;font-weight:bold">{l['address']}</a></td>
-              <td>{price_cell}</td>
-              <td>{l.get('details','')}</td>
-              <td>{l['source']}</td>
+                price_cell += f"<br><span style='color:{color};font-size:11px'>{arrow} ${abs(diff):,} (was ${l['old_price']:,})</span>"
+            rows += f"""<tr style="border-bottom:1px solid #eee">
+              <td style="padding:8px"><a href="{l['url']}" style="color:#2c5f8a;font-weight:bold">{l['address']}</a></td>
+              <td style="padding:8px">{price_cell}</td>
+              <td style="padding:8px">{l.get('details','')}</td>
+              <td style="padding:8px;color:#666;font-size:12px">{l['source']}</td>
             </tr>"""
         return rows
 
     if is_day_one:
-        content_section = f"""
-        <h2 style="color:#2c5f8a;border-bottom:2px solid #2c5f8a;padding-bottom:6px">
-          📋 All Active Listings — Day 1 Baseline ({len(all_listings)} found)
-        </h2>
+        body = f"""<h2 style="color:#2c5f8a;border-bottom:2px solid #2c5f8a;padding-bottom:6px">
+          All Active Listings - Day 1 Baseline ({len(all_listings)} found)</h2>
         <table style="width:100%;border-collapse:collapse">
-          <tr style="background:#2c5f8a;color:white">
-            <th style="padding:10px;text-align:left">Address</th>
-            <th style="padding:10px;text-align:left">Price</th>
-            <th style="padding:10px;text-align:left">Details</th>
-            <th style="padding:10px;text-align:left">Source</th>
-          </tr>
-          {listing_rows(all_listings)}
-        </table>"""
+          <tr><th {th}>Address</th><th {th}>Price</th><th {th}>Details</th><th {th}>Source</th></tr>
+          {listing_rows(all_listings)}</table>"""
     else:
-        content_section = f"""
-        <h2 style="color:#2c5f8a;border-bottom:2px solid #2c5f8a;padding-bottom:6px">
-          🆕 New Listings ({len(new_listings)})
-        </h2>
+        body = f"""<h2 style="color:#2c5f8a;border-bottom:2px solid #2c5f8a;padding-bottom:6px">
+          New Listings ({len(new_listings)})</h2>
         <table style="width:100%;border-collapse:collapse">
-          <tr style="background:#2c5f8a;color:white">
-            <th style="padding:10px;text-align:left">Address</th>
-            <th style="padding:10px;text-align:left">Price</th>
-            <th style="padding:10px;text-align:left">Details</th>
-            <th style="padding:10px;text-align:left">Source</th>
-          </tr>
-          {listing_rows(new_listings)}
-        </table>
-
+          <tr><th {th}>Address</th><th {th}>Price</th><th {th}>Details</th><th {th}>Source</th></tr>
+          {listing_rows(new_listings)}</table>
         <h2 style="color:#2c5f8a;border-bottom:2px solid #2c5f8a;padding-bottom:6px;margin-top:28px">
-          💰 Price Changes ({len(price_changes)})
-        </h2>
+          Price Changes ({len(price_changes)})</h2>
         <table style="width:100%;border-collapse:collapse">
-          <tr style="background:#2c5f8a;color:white">
-            <th style="padding:10px;text-align:left">Address</th>
-            <th style="padding:10px;text-align:left">New Price</th>
-            <th style="padding:10px;text-align:left">Details</th>
-            <th style="padding:10px;text-align:left">Source</th>
-          </tr>
-          {listing_rows(price_changes, show_old_price=True)}
-        </table>"""
+          <tr><th {th}>Address</th><th {th}>New Price</th><th {th}>Details</th><th {th}>Source</th></tr>
+          {listing_rows(price_changes, show_old_price=True)}</table>"""
 
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="font-family:Arial,sans-serif;color:#333;max-width:720px;margin:0 auto;padding:16px">
+    status_rows = "".join(
+        f"<tr><td style='padding:6px 8px;font-weight:bold'>{s}</td><td style='padding:6px 8px'>{v}</td></tr>"
+        for s, v in scraper_status.items()
+    )
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;color:#333;max-width:740px;margin:0 auto;padding:16px">
   <div style="background:#2c5f8a;color:white;padding:16px 20px;border-radius:6px">
-    <h1 style="margin:0;font-size:20px">🏠 Las Cruces SFR Daily Report</h1>
-    <p style="margin:4px 0 0;font-size:14px;opacity:.85">{run_date} &nbsp;|&nbsp; Max $180K · 2+ BD · 1+ BA · 1,000+ sq ft · Single-Family</p>
+    <h1 style="margin:0;font-size:20px">Las Cruces SFR Daily Report</h1>
+    <p style="margin:4px 0 0;font-size:14px;opacity:.85">{run_date} | Max $180K - 2+ BD - 1+ BA - 1,000+ sq ft</p>
   </div>
-
   <div style="background:#f0f6ff;border-left:4px solid #2c5f8a;padding:12px 16px;margin:16px 0;border-radius:4px;font-size:13px">
-    <strong>Sources searched:</strong> Zillow, Redfin, Realtor.com &nbsp;·&nbsp;
-    <strong>Total qualifying:</strong> {len(all_listings)} active listings &nbsp;·&nbsp;
-    <strong>{"New + price changes" if not is_day_one else "Day 1 — full baseline"}</strong>
+    <strong>Total listings found:</strong> {len(all_listings)} &nbsp;|&nbsp;
+    <strong>{"Day 1 full baseline" if is_day_one else f"{len(new_listings)} new / {len(price_changes)} price changes"}</strong>
   </div>
-
-  {content_section}
-
-  <div style="margin-top:28px;font-size:12px;color:#888;border-top:1px solid #ddd;padding-top:12px">
-    <p>🔗 Search directly:
-      <a href="https://www.zillow.com/las-cruces-nm/houses/?searchQueryState=%7B%22filterState%22%3A%7B%22price%22%3A%7B%22max%22%3A180000%7D%2C%22beds%22%3A%7B%22min%22%3A2%7D%2C%22baths%22%3A%7B%22min%22%3A1%7D%2C%22sqft%22%3A%7B%22min%22%3A1000%7D%7D%7D">Zillow</a> ·
-      <a href="https://www.redfin.com/city/10005/NM/Las-Cruces/filter/max-price=180000,min-beds=2,min-baths=1,min-sqft=1000,property-type=house">Redfin</a> ·
+  <div style="background:#fff8e1;border-left:4px solid #f9a825;padding:10px 14px;margin:16px 0;border-radius:4px;font-size:13px">
+    <strong>Note on Zillow:</strong> Zillow blocks all automated tools. Use the manual link below to check Zillow.
+  </div>
+  {body}
+  <details style="margin-top:24px;font-size:12px;color:#555;background:#f9f9f9;padding:12px;border-radius:4px">
+    <summary style="cursor:pointer;font-weight:bold">Scraper Status (click to expand)</summary>
+    <table style="margin-top:8px;width:100%;border-collapse:collapse">{status_rows}</table>
+  </details>
+  <div style="margin-top:20px;font-size:12px;color:#888;border-top:1px solid #ddd;padding-top:12px">
+    <p>Search manually:
+      <a href="https://www.zillow.com/las-cruces-nm/houses/?searchQueryState=%7B%22filterState%22%3A%7B%22price%22%3A%7B%22max%22%3A180000%7D%2C%22beds%22%3A%7B%22min%22%3A2%7D%2C%22baths%22%3A%7B%22min%22%3A1%7D%2C%22sqft%22%3A%7B%22min%22%3A1000%7D%7D%7D">Zillow</a> /
+      <a href="https://www.redfin.com/city/10004/NM/Las-Cruces/filter/max-price=180000,min-beds=2,min-baths=1,min-sqft=1000,property-type=house">Redfin</a> /
       <a href="https://www.realtor.com/realestateandhomes-search/Las-Cruces_NM/type-single-family-home/price-na-180000/beds-2/sqft-1000">Realtor.com</a>
     </p>
-    <p>This report is generated automatically. Data sourced from public listing sites and may have slight delays.</p>
   </div>
-</body>
-</html>"""
+</body></html>"""
 
 
-# ─── Email sender ─────────────────────────────────────────────────────────────
-
-def send_email(subject: str, html_body: str):
+def send_email(subject, html_body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
     msg["To"]      = RECIPIENT_EMAIL
-
     msg.attach(MIMEText(html_body, "html"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_USER, GMAIL_APP_PASS)
         smtp.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-
     log.info(f"Email sent to {RECIPIENT_EMAIL}")
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# --- Main --------------------------------------------------------------------
 
 def main():
+    if not SCRAPER_API_KEY:
+        raise ValueError("SCRAPER_API_KEY is not set.")
+
     run_date   = datetime.date.today().strftime("%B %d, %Y")
     state      = load_state()
     is_day_one = len(state) == 0
 
-    log.info("Fetching listings from all sources...")
-    raw = fetch_zillow() + fetch_redfin() + fetch_realtor()
-    listings   = deduplicate(raw)
-
+    log.info("Fetching listings via ScraperAPI...")
+    listings = deduplicate(fetch_redfin() + fetch_realtor())
     log.info(f"Total unique qualifying listings: {len(listings)}")
 
     new_l, price_ch, all_l = compute_diff(listings, state)
 
     if is_day_one:
-        subject = f"🏠 Las Cruces SFR — Day 1 Baseline: {len(all_l)} Active Listings | {run_date}"
+        subject = f"Las Cruces SFR - Day 1 Baseline: {len(all_l)} Listings | {run_date}"
     else:
-        subject = (
-            f"🏠 Las Cruces SFR — {len(new_l)} New · {len(price_ch)} Price Changes | {run_date}"
-        )
+        subject = f"Las Cruces SFR - {len(new_l)} New / {len(price_ch)} Price Changes | {run_date}"
 
-    html = build_html_report(new_l, price_ch, all_l, is_day_one, run_date)
+    send_email(subject, build_html_report(new_l, price_ch, all_l, is_day_one, run_date))
 
-    send_email(subject, html)
-
-    # Update state
-    new_state = {}
-    for l in listings:
-        new_state[l["id"]] = {"price": l["price"], "address": l["address"]}
+    new_state = {l["id"]: {"price": l["price"], "address": l["address"]} for l in listings}
     save_state(new_state)
-
-    log.info("Done. State saved.")
+    log.info("Done.")
 
 
 if __name__ == "__main__":
